@@ -1,0 +1,10 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+# Local TLS certificates from `mkcert localhost 127.0.0.1 ::1`. Per-developer,
+# not safe to share — generate your own.
+*.pem

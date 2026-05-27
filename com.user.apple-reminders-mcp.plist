@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for apple-reminders-mcp.
+
+  Before installing:
+    1. Replace REPLACE_WITH_ABSOLUTE_PATH with the absolute path to the cloned repo.
+    2. Replace REPLACE_WITH_PYTHON_PATH with the absolute path to the venv's python
+       (e.g. /Users/yourname/code/apple-reminders-mcp/.venv/bin/python).
+    3. If you want auth, uncomment and set REMINDERS_API_KEY. Otherwise leave
+       it out — loopback bind keeps the server safe.
+    4. If you want HTTPS (recommended; required by some clients), set
+       REMINDERS_SSL_KEYFILE and REMINDERS_SSL_CERTFILE to absolute paths.
+
+  Install with:
+    cp com.user.apple-reminders-mcp.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.user.apple-reminders-mcp.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.apple-reminders-mcp</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_WITH_PYTHON_PATH</string>
+        <string>REPLACE_WITH_ABSOLUTE_PATH/server.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>REPLACE_WITH_ABSOLUTE_PATH</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>REMINDERS_HOST</key>
+        <string>127.0.0.1</string>
+        <key>REMINDERS_PORT</key>
+        <string>8765</string>
+        <!-- Uncomment to enable bearer-token auth:
+        <key>REMINDERS_API_KEY</key>
+        <string>REPLACE_WITH_YOUR_API_KEY</string>
+        -->
+        <!-- Uncomment to enable HTTPS:
+        <key>REMINDERS_SSL_KEYFILE</key>
+        <string>REPLACE_WITH_ABSOLUTE_PATH/localhost+2-key.pem</string>
+        <key>REMINDERS_SSL_CERTFILE</key>
+        <string>REPLACE_WITH_ABSOLUTE_PATH/localhost+2.pem</string>
+        -->
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/apple-reminders-mcp.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/apple-reminders-mcp.log</string>
+</dict>
+</plist>

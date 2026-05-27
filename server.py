@@ -6,9 +6,16 @@ A generic Model Context Protocol server that exposes the macOS Reminders app
 to MCP clients (Claude Desktop / Cowork, IDE plugins, custom agents) over HTTP
 with bearer-token authentication.
 
-Runs on the user's Mac and shells out to JavaScript for Automation (JXA) via
-`osascript`. The tool surface is intentionally generic so the server can be
-reused by anyone who wants programmatic access to Reminders.
+Runs on the user's Mac and talks to Reminders.app via PyObjC bindings to the
+EventKit framework (the same API the Reminders app itself uses). Originally
+this server shelled out to JavaScript for Automation (JXA) via osascript, but
+that turned out to be unusable for any user with more than a few dozen
+reminders — every property access is a separate Apple Event RPC, so a 225-
+reminder database took 30+ seconds just to enumerate. Native EventKit drops
+that to ~50ms.
+
+The tool surface is intentionally generic so the server can be reused by
+anyone who wants programmatic access to Reminders.
 
 Tools exposed:
   - list_lists
@@ -45,11 +52,11 @@ Environment variables:
 
 from __future__ import annotations
 
-import json
 import os
 import secrets
-import subprocess
+import threading
 import time
+from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -58,6 +65,16 @@ try:
     load_dotenv()
 except ImportError:
     pass
+
+# PyObjC bindings to EventKit. EKEventStore is the entry point; calendars are
+# "lists" in the Reminders UI; EKReminder is a single reminder.
+from EventKit import (
+    EKAlarm,
+    EKEntityTypeReminder,
+    EKEventStore,
+    EKReminder,
+)
+from Foundation import NSCalendar, NSDate, NSDateComponents, NSRunLoop
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -112,77 +129,182 @@ if bool(SSL_KEYFILE) != bool(SSL_CERTFILE):
 USE_HTTPS = bool(SSL_KEYFILE and SSL_CERTFILE)
 
 
-# --- JXA helpers -------------------------------------------------------------
+# --- EventKit helpers --------------------------------------------------------
+#
+# Everything here wraps EKEventStore. EventKit's fetch API is asynchronous
+# (completion-handler based) but the MCP tool functions are synchronous, so
+# we drive the main runloop until each callback fires. The store itself is a
+# process-wide singleton — there's no benefit to multiple instances and
+# creating one isn't cheap.
 
-# Shared JXA preamble: defines a serializer and a by-id lookup helper.
-# We keep this in one place so every tool returns the same shape.
-JXA_PREAMBLE = r"""
-function dateToISO(d) { return d ? d.toISOString() : null; }
-
-function serializeReminder(r, listName) {
-  return {
-    id: r.id(),
-    name: r.name(),
-    body: r.body() || "",
-    completed: r.completed(),
-    completionDate: dateToISO(r.completionDate()),
-    creationDate: dateToISO(r.creationDate()),
-    modificationDate: dateToISO(r.modificationDate()),
-    dueDate: dateToISO(r.dueDate()),
-    remindMeDate: dateToISO(r.remindMeDate()),
-    priority: r.priority(),
-    list: listName,
-  };
-}
-
-function findReminderById(app, id) {
-  for (const l of app.lists()) {
-    for (const r of l.reminders()) {
-      if (r.id() === id) return { reminder: r, list: l };
-    }
-  }
-  return null;
-}
-
-function findListByName(app, name) {
-  for (const l of app.lists()) {
-    if (l.name() === name) return l;
-  }
-  return null;
-}
-"""
+_store: EKEventStore | None = None
+_store_lock = threading.Lock()
 
 
-def _run_jxa(script: str) -> Any:
-    """Run a JXA script via osascript and parse its JSON stdout."""
-    try:
-        result = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "osascript not found. This server must run on macOS."
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("osascript timed out after 30s")
+def _get_store() -> EKEventStore:
+    """Lazy singleton EKEventStore. Requests Reminders access on first call."""
+    global _store
+    with _store_lock:
+        if _store is not None:
+            return _store
+        store = EKEventStore.alloc().init()
 
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"osascript error: {result.stderr.strip() or 'unknown failure'}"
-        )
+        # macOS 14 split Reminders auth into "full" and "write-only". We need
+        # full (we read + write). Older macOS uses the generic per-entity API.
+        done = {"ok": False, "granted": False, "error": None}
 
-    out = result.stdout.strip()
-    if not out:
+        def _cb(granted, error):
+            done["granted"] = bool(granted)
+            done["error"] = error
+            done["ok"] = True
+
+        if hasattr(store, "requestFullAccessToRemindersWithCompletion_"):
+            store.requestFullAccessToRemindersWithCompletion_(_cb)
+        else:
+            store.requestAccessToEntityType_completion_(EKEntityTypeReminder, _cb)
+
+        _pump_runloop_until(lambda: done["ok"], timeout=30)
+
+        if not done["granted"]:
+            raise RuntimeError(
+                f"Reminders access denied (error={done['error']}). Grant in "
+                "System Settings → Privacy & Security → Reminders, then "
+                "restart the server."
+            )
+        _store = store
+        return store
+
+
+def _pump_runloop_until(predicate, timeout: float = 30.0) -> None:
+    """Drive the current thread's NSRunLoop until `predicate()` is true or
+    timeout elapses. Required because EventKit's fetch / save methods deliver
+    results via completion handlers dispatched on the main runloop."""
+    deadline = time.monotonic() + timeout
+    rl = NSRunLoop.currentRunLoop()
+    while not predicate() and time.monotonic() < deadline:
+        rl.runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.05))
+    if not predicate():
+        raise RuntimeError(f"EventKit operation timed out after {timeout}s")
+
+
+def _ns_date_to_iso(d) -> Optional[str]:
+    """NSDate → ISO 8601 string in local time (matches the previous JXA
+    output, which used .toISOString() on a JS Date)."""
+    if d is None:
         return None
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError:
-        # Some JXA expressions return bare strings/numbers without
-        # JSON.stringify; surface them as raw output for debugging.
-        return out
+    # NSDate.description() returns "YYYY-MM-DD HH:MM:SS +ZZZZ" — convert via
+    # timeIntervalSince1970 for an exact, locale-free representation.
+    ts = d.timeIntervalSince1970()
+    return datetime.utcfromtimestamp(ts).isoformat() + "Z"
+
+
+def _date_components_to_iso(comps) -> Optional[str]:
+    """EKReminder.dueDateComponents is an NSDateComponents, not an NSDate.
+    Resolve through the system calendar to get a real instant."""
+    if comps is None:
+        return None
+    cal = NSCalendar.currentCalendar()
+    d = cal.dateFromComponents_(comps)
+    return _ns_date_to_iso(d)
+
+
+def _iso_to_ns_date(s: str):
+    """Parse ISO 8601 (with or without trailing Z / offset) → NSDate."""
+    # Python 3.11+ accepts "Z"; for older, swap to +00:00.
+    s = s.replace("Z", "+00:00") if s.endswith("Z") else s
+    dt = datetime.fromisoformat(s)
+    return NSDate.dateWithTimeIntervalSince1970_(dt.timestamp())
+
+
+def _ns_date_to_components(d):
+    """NSDate → NSDateComponents (year/month/day/hour/minute/second) using
+    the current calendar. EKReminder stores due dates as components."""
+    cal = NSCalendar.currentCalendar()
+    units = (
+        (1 << 2)   # Year
+        | (1 << 3) # Month
+        | (1 << 4) # Day
+        | (1 << 5) # Hour
+        | (1 << 6) # Minute
+        | (1 << 7) # Second
+    )
+    return cal.components_fromDate_(units, d)
+
+
+def _first_alarm_date(reminder) -> Optional[str]:
+    """Return the first absolute-date alarm on a reminder, or None."""
+    alarms = reminder.alarms() or []
+    for a in alarms:
+        d = a.absoluteDate()
+        if d is not None:
+            return _ns_date_to_iso(d)
+    return None
+
+
+def _serialize_reminder(r) -> dict:
+    """Shape matches the legacy JXA output exactly so existing clients don't
+    need to change. Dates are ISO 8601 in UTC; priority follows EventKit's
+    0/1/5/9 convention (= Reminders.app's own values)."""
+    return {
+        "id": r.calendarItemIdentifier(),
+        "name": r.title() or "",
+        "body": r.notes() or "",
+        "completed": bool(r.isCompleted()),
+        "completionDate": _ns_date_to_iso(r.completionDate()),
+        "creationDate": _ns_date_to_iso(r.creationDate()),
+        "modificationDate": _ns_date_to_iso(r.lastModifiedDate()),
+        "dueDate": _date_components_to_iso(r.dueDateComponents()),
+        "remindMeDate": _first_alarm_date(r),
+        "priority": int(r.priority()),
+        "list": r.calendar().title(),
+    }
+
+
+def _find_list_by_name(store: EKEventStore, name: str):
+    """Linear search over calendars. There are usually <20 of these, so it's
+    fine; EventKit doesn't expose a by-name lookup."""
+    for cal in store.calendarsForEntityType_(EKEntityTypeReminder):
+        if cal.title() == name:
+            return cal
+    return None
+
+
+def _find_reminder_by_id(store: EKEventStore, reminder_id: str):
+    """O(1) — EventKit indexes by calendarItemIdentifier internally."""
+    item = store.calendarItemWithIdentifier_(reminder_id)
+    # calendarItemWithIdentifier_ can also return EKEvent; sanity-filter.
+    if item is None or not isinstance(item, EKReminder):
+        return None
+    return item
+
+
+def _fetch_reminders(store: EKEventStore, calendars=None) -> list:
+    """Synchronously fetch reminders matching a calendars predicate.
+    `calendars=None` means all calendars."""
+    pred = store.predicateForRemindersInCalendars_(calendars)
+    bucket = {"reminders": None, "done": False}
+
+    def _cb(reminders):
+        bucket["reminders"] = list(reminders) if reminders else []
+        bucket["done"] = True
+
+    store.fetchRemindersMatchingPredicate_completion_(pred, _cb)
+    _pump_runloop_until(lambda: bucket["done"], timeout=30)
+    return bucket["reminders"]
+
+
+def _save(store: EKEventStore, reminder) -> None:
+    """Save a reminder, raising on failure. `commit=True` writes immediately
+    so iCloud sync starts; without it, changes batch until you call commit()."""
+    ok, err = store.saveReminder_commit_error_(reminder, True, None)
+    if not ok:
+        raise RuntimeError(f"saveReminder failed: {err}")
+
+
+def _delete(store: EKEventStore, reminder) -> None:
+    ok, err = store.removeReminder_commit_error_(reminder, True, None)
+    if not ok:
+        raise RuntimeError(f"removeReminder failed: {err}")
 
 
 # --- MCP server --------------------------------------------------------------
@@ -212,6 +334,11 @@ else:
 mcp = FastMCP("apple-reminders", transport_security=_transport_security)
 
 
+# Sentinel for update_reminder: pass "null" (a literal string) to clear a
+# date field, since None means "leave unchanged" in our partial-update model.
+_CLEAR = "null"
+
+
 @mcp.tool()
 def list_lists() -> list[dict]:
     """List every Reminders list (folder).
@@ -219,12 +346,11 @@ def list_lists() -> list[dict]:
     Returns:
         A list of objects with keys `id` and `name`.
     """
-    script = JXA_PREAMBLE + r"""
-        const app = Application('Reminders');
-        const out = app.lists().map(l => ({ id: l.id(), name: l.name() }));
-        JSON.stringify(out);
-    """
-    return _run_jxa(script) or []
+    store = _get_store()
+    return [
+        {"id": c.calendarIdentifier(), "name": c.title()}
+        for c in store.calendarsForEntityType_(EKEntityTypeReminder)
+    ]
 
 
 @mcp.tool()
@@ -247,32 +373,29 @@ def list_reminders(
         Reminder objects with keys: id, name, body, completed, completionDate,
         creationDate, modificationDate, dueDate, remindMeDate, priority, list.
     """
-    args = json.dumps({
-        "listName": list_name,
-        "completed": completed,
-        "search": search.lower() if search else None,
-        "limit": limit,
-    })
-    script = JXA_PREAMBLE + f"""
-        const args = {args};
-        const app = Application('Reminders');
-        const out = [];
-        outer: for (const l of app.lists()) {{
-            if (args.listName !== null && l.name() !== args.listName) continue;
-            for (const r of l.reminders()) {{
-                if (args.completed !== null && r.completed() !== args.completed) continue;
-                const s = serializeReminder(r, l.name());
-                if (args.search !== null) {{
-                    const hay = (s.name + ' ' + s.body).toLowerCase();
-                    if (!hay.includes(args.search)) continue;
-                }}
-                out.push(s);
-                if (args.limit !== null && out.length >= args.limit) break outer;
-            }}
-        }}
-        JSON.stringify(out);
-    """
-    return _run_jxa(script) or []
+    store = _get_store()
+    if list_name is not None:
+        cal = _find_list_by_name(store, list_name)
+        if cal is None:
+            raise RuntimeError(f"List not found: {list_name}")
+        cals = [cal]
+    else:
+        cals = None  # all calendars
+
+    reminders = _fetch_reminders(store, cals)
+    needle = search.lower() if search else None
+    out: list[dict] = []
+    for r in reminders:
+        if completed is not None and bool(r.isCompleted()) != completed:
+            continue
+        if needle is not None:
+            hay = ((r.title() or "") + " " + (r.notes() or "")).lower()
+            if needle not in hay:
+                continue
+        out.append(_serialize_reminder(r))
+        if limit is not None and len(out) >= limit:
+            break
+    return out
 
 
 @mcp.tool()
@@ -285,14 +408,9 @@ def get_reminder(id: str) -> Optional[dict]:
     Returns:
         The reminder object, or null if not found.
     """
-    args = json.dumps({"id": id})
-    script = JXA_PREAMBLE + f"""
-        const args = {args};
-        const app = Application('Reminders');
-        const found = findReminderById(app, args.id);
-        JSON.stringify(found ? serializeReminder(found.reminder, found.list.name()) : null);
-    """
-    return _run_jxa(script)
+    store = _get_store()
+    r = _find_reminder_by_id(store, id)
+    return _serialize_reminder(r) if r is not None else None
 
 
 @mcp.tool()
@@ -318,34 +436,29 @@ def create_reminder(
     Returns:
         The created reminder, serialized.
     """
-    args = json.dumps({
-        "name": name,
-        "listName": list_name,
-        "body": body,
-        "dueDate": due_date,
-        "remindMeDate": remind_me_date,
-        "priority": priority,
-    })
-    script = JXA_PREAMBLE + f"""
-        const args = {args};
-        const app = Application('Reminders');
-        let targetList;
-        if (args.listName !== null) {{
-            targetList = findListByName(app, args.listName);
-            if (!targetList) throw new Error('List not found: ' + args.listName);
-        }} else {{
-            targetList = app.defaultList();
-        }}
-        const props = {{ name: args.name }};
-        if (args.body !== null) props.body = args.body;
-        if (args.dueDate !== null) props.dueDate = new Date(args.dueDate);
-        if (args.remindMeDate !== null) props.remindMeDate = new Date(args.remindMeDate);
-        if (args.priority !== null) props.priority = args.priority;
-        const r = app.Reminder(props);
-        targetList.reminders.push(r);
-        JSON.stringify(serializeReminder(r, targetList.name()));
-    """
-    return _run_jxa(script)
+    store = _get_store()
+    if list_name is not None:
+        cal = _find_list_by_name(store, list_name)
+        if cal is None:
+            raise RuntimeError(f"List not found: {list_name}")
+    else:
+        cal = store.defaultCalendarForNewReminders()
+        if cal is None:
+            raise RuntimeError("No default reminders list configured")
+
+    r = EKReminder.reminderWithEventStore_(store)
+    r.setCalendar_(cal)
+    r.setTitle_(name)
+    if body is not None:
+        r.setNotes_(body)
+    if due_date is not None:
+        r.setDueDateComponents_(_ns_date_to_components(_iso_to_ns_date(due_date)))
+    if remind_me_date is not None:
+        r.addAlarm_(EKAlarm.alarmWithAbsoluteDate_(_iso_to_ns_date(remind_me_date)))
+    if priority is not None:
+        r.setPriority_(priority)
+    _save(store, r)
+    return _serialize_reminder(r)
 
 
 @mcp.tool()
@@ -373,32 +486,29 @@ def update_reminder(
     Returns:
         The updated reminder, serialized.
     """
-    args = json.dumps({
-        "id": id,
-        "name": name,
-        "body": body,
-        "dueDate": due_date,
-        "remindMeDate": remind_me_date,
-        "priority": priority,
-    })
-    script = JXA_PREAMBLE + f"""
-        const args = {args};
-        const app = Application('Reminders');
-        const found = findReminderById(app, args.id);
-        if (!found) throw new Error('Reminder not found: ' + args.id);
-        const r = found.reminder;
-        if (args.name !== null) r.name = args.name;
-        if (args.body !== null) r.body = args.body;
-        if (args.dueDate !== null) {{
-            r.dueDate = (args.dueDate === 'null') ? null : new Date(args.dueDate);
-        }}
-        if (args.remindMeDate !== null) {{
-            r.remindMeDate = (args.remindMeDate === 'null') ? null : new Date(args.remindMeDate);
-        }}
-        if (args.priority !== null) r.priority = args.priority;
-        JSON.stringify(serializeReminder(r, found.list.name()));
-    """
-    return _run_jxa(script)
+    store = _get_store()
+    r = _find_reminder_by_id(store, id)
+    if r is None:
+        raise RuntimeError(f"Reminder not found: {id}")
+    if name is not None:
+        r.setTitle_(name)
+    if body is not None:
+        r.setNotes_(body)
+    if due_date is not None:
+        if due_date == _CLEAR:
+            r.setDueDateComponents_(None)
+        else:
+            r.setDueDateComponents_(_ns_date_to_components(_iso_to_ns_date(due_date)))
+    if remind_me_date is not None:
+        # Clear any existing alarms, then optionally set a new one.
+        for a in list(r.alarms() or []):
+            r.removeAlarm_(a)
+        if remind_me_date != _CLEAR:
+            r.addAlarm_(EKAlarm.alarmWithAbsoluteDate_(_iso_to_ns_date(remind_me_date)))
+    if priority is not None:
+        r.setPriority_(priority)
+    _save(store, r)
+    return _serialize_reminder(r)
 
 
 @mcp.tool()
@@ -412,16 +522,13 @@ def complete_reminder(id: str, completed: bool = True) -> dict:
     Returns:
         The updated reminder.
     """
-    args = json.dumps({"id": id, "completed": completed})
-    script = JXA_PREAMBLE + f"""
-        const args = {args};
-        const app = Application('Reminders');
-        const found = findReminderById(app, args.id);
-        if (!found) throw new Error('Reminder not found: ' + args.id);
-        found.reminder.completed = args.completed;
-        JSON.stringify(serializeReminder(found.reminder, found.list.name()));
-    """
-    return _run_jxa(script)
+    store = _get_store()
+    r = _find_reminder_by_id(store, id)
+    if r is None:
+        raise RuntimeError(f"Reminder not found: {id}")
+    r.setCompleted_(completed)
+    _save(store, r)
+    return _serialize_reminder(r)
 
 
 @mcp.tool()
@@ -434,16 +541,12 @@ def delete_reminder(id: str) -> dict:
     Returns:
         `{ deleted: true, id }` on success.
     """
-    args = json.dumps({"id": id})
-    script = JXA_PREAMBLE + f"""
-        const args = {args};
-        const app = Application('Reminders');
-        const found = findReminderById(app, args.id);
-        if (!found) throw new Error('Reminder not found: ' + args.id);
-        app.delete(found.reminder);
-        JSON.stringify({{ deleted: true, id: args.id }});
-    """
-    return _run_jxa(script)
+    store = _get_store()
+    r = _find_reminder_by_id(store, id)
+    if r is None:
+        raise RuntimeError(f"Reminder not found: {id}")
+    _delete(store, r)
+    return {"deleted": True, "id": id}
 
 
 @mcp.tool()
@@ -457,20 +560,16 @@ def move_reminder(id: str, list_name: str) -> dict:
     Returns:
         The reminder after the move, with `list` set to the new list name.
     """
-    args = json.dumps({"id": id, "listName": list_name})
-    script = JXA_PREAMBLE + f"""
-        const args = {args};
-        const app = Application('Reminders');
-        const found = findReminderById(app, args.id);
-        if (!found) throw new Error('Reminder not found: ' + args.id);
-        const target = findListByName(app, args.listName);
-        if (!target) throw new Error('List not found: ' + args.listName);
-        app.move(found.reminder, {{ to: target }});
-        // After moving, the object reference may be stale — look it up again.
-        const refreshed = findReminderById(app, args.id);
-        JSON.stringify(refreshed ? serializeReminder(refreshed.reminder, refreshed.list.name()) : null);
-    """
-    return _run_jxa(script)
+    store = _get_store()
+    r = _find_reminder_by_id(store, id)
+    if r is None:
+        raise RuntimeError(f"Reminder not found: {id}")
+    target = _find_list_by_name(store, list_name)
+    if target is None:
+        raise RuntimeError(f"List not found: {list_name}")
+    r.setCalendar_(target)
+    _save(store, r)
+    return _serialize_reminder(r)
 
 
 # --- HTTP transport + auth ---------------------------------------------------
